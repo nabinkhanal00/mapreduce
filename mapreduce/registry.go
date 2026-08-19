@@ -3,6 +3,8 @@ package mapreduce
 import (
 	"fmt"
 	"sync"
+
+	"github.com/nabinkhanal00/labs/mapreduce/format"
 )
 
 var (
@@ -10,9 +12,9 @@ var (
 	muReducer sync.RWMutex
 	muFormat  sync.RWMutex
 
-	mappers  map[string]Mapper  = make(map[string]Mapper)
-	reducers map[string]Reducer = make(map[string]Reducer)
-	formats  map[string]Format  = make(map[string]Format)
+	mappers  map[string]Mapper        = make(map[string]Mapper)
+	reducers map[string]Reducer       = make(map[string]Reducer)
+	formats  map[string]format.Format = make(map[string]format.Format)
 )
 
 func RegisterMapper(key string, m Mapper) {
@@ -39,7 +41,7 @@ func RegisterReducer(key string, r Reducer) {
 	reducers[key] = r
 }
 
-func RegisterFormat(key string, f Format) {
+func RegisterFormat(key string, f format.Format) {
 	muFormat.Lock()
 	defer muFormat.Unlock()
 	if f == nil {
@@ -71,7 +73,7 @@ func lookupReducer(key string) (Reducer, error) {
 	return r, nil
 }
 
-func lookupFormat(key string) (Format, error) {
+func lookupFormat(key string) (format.Format, error) {
 	muFormat.RLock()
 	defer muFormat.RUnlock()
 	f, ok := formats[key]

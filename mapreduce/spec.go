@@ -20,9 +20,10 @@ type Output struct {
 }
 
 type Specification struct {
-	Inputs   []Input
-	Output   Output
-	Machines int
+	Inputs     []Input
+	Output     Output
+	Machines   int
+	TaskPrefix string
 }
 
 type Result struct {

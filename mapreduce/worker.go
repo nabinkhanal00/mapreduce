@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/rpc"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/denisbrodbeck/machineid"
@@ -17,6 +18,7 @@ type Worker struct {
 	MasterAddress netip.AddrPort
 	logger        *slog.Logger
 	currentTask   Task
+	tasklock      sync.RWMutex
 	*WorkerOpts
 }
 
@@ -51,16 +53,23 @@ func NewWorker(coordAddr string, opts *WorkerOpts) (*Worker, error) {
 	}, nil
 }
 
-func (w *Worker) performHealthChecks(check func() (bool, error), done <-chan struct{}, cancel context.CancelFunc) {
+func (w *Worker) performHealthChecks(check func() (bool, error), ctx context.Context, cancel context.CancelFunc) {
 	ticker := time.NewTicker(w.HealthCheckTime)
+	defer ticker.Stop()
 	for {
+		counter := 0
 		select {
-		case <-done:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			stop, err := check()
 			if err != nil {
 				w.logger.Warn("mapreduce: HealthCheck", slog.String("status", "failed"))
+				counter++
+				if counter > 10 {
+					cancel()
+					return
+				}
 			}
 			if stop {
 				cancel()
@@ -76,11 +85,12 @@ func (w *Worker) Run(ctx context.Context) error {
 		return fmt.Errorf("mapreduce: Connection: worker dial %s: %w", w.MasterAddress.String(), err)
 	}
 	sendHealthCheck := func() (bool, error) {
-		taskID := -1
+		taskID := ""
 		taskType := NoneType
-		if w.currentTask != nil {
-			taskID = w.currentTask.GetID()
-			taskType = w.currentTask.Type()
+		task := w.getCurrentTask()
+		if task != nil {
+			taskID = task.GetID()
+			taskType = task.Type()
 		}
 		args := &HealthCheckArgs{
 			HostID: w.ID,
@@ -97,9 +107,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	// stop sending healthcheck when program returns
 	defer func() { shouldStopHealthcheck <- struct{}{} }()
 
-	hctx, cancel := context.WithCancel(context.Background())
+	workerCtx, cancel := context.WithCancel(ctx)
 
-	go w.performHealthChecks(sendHealthCheck, shouldStopHealthcheck, cancel)
+	go w.performHealthChecks(sendHealthCheck, workerCtx, cancel)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -118,19 +128,33 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 		task := reply.Task
-		w.currentTask = task
+		w.setCurrentTask(task)
 		report := ReportArgs{
 			TaskID: task.GetID(),
 			Type:   task.Type(),
 			HostID: w.ID,
 		}
-		if err := task.Execute(hctx); err != nil {
+		taskCtx, taskCancel := context.WithCancel(workerCtx)
+		if err := task.Execute(taskCtx); err != nil {
 			report.Err = err.Error()
 		}
+		taskCancel()
 		w.currentTask = nil
 		if err := client.Call("Coordinator.ReportTask", &report, nil); err != nil {
 			return fmt.Errorf("mapreduce: ReportTask: %w", err)
 		}
 
 	}
+}
+
+func (w *Worker) getCurrentTask() Task {
+	w.tasklock.RLock()
+	defer w.tasklock.RUnlock()
+	return w.currentTask
+}
+
+func (w *Worker) setCurrentTask(task Task) {
+	w.tasklock.Lock()
+	defer w.tasklock.Unlock()
+	w.currentTask = task
 }

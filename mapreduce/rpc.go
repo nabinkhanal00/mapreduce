@@ -10,7 +10,7 @@ type GetTaskReply struct {
 }
 
 type ReportArgs struct {
-	TaskID int
+	TaskID string
 	HostID string
 	Type   TaskType
 	Err    string
@@ -19,7 +19,7 @@ type ReportReply struct{}
 
 type HealthCheckArgs struct {
 	HostID string
-	TaskID int
+	TaskID string
 	Type   TaskType
 }
 type HealthCheckReply struct {

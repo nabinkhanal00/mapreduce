@@ -37,8 +37,8 @@ type Coordinator struct {
 	intermediateDir string
 	addr            string
 
-	mapTasks    []*taskState
-	reduceTasks []*taskState
+	mapTasks    map[string]*taskState
+	reduceTasks map[string]*taskState
 
 	phase    phase
 	started  time.Time
@@ -48,10 +48,11 @@ type Coordinator struct {
 	taskTimeout     time.Duration
 	waitHealthCheck time.Duration
 
-	result Result
+	result            Result
+	fileServerAddress string
 }
 
-func NewCoordinator(spec Specification, intermediateDir string, timeout time.Duration) (*Coordinator, error) {
+func NewCoordinator(spec Specification, intermediateDir string, fileServerAddress string, timeout time.Duration) (*Coordinator, error) {
 	if spec.Output.NumTasks < 1 {
 		return nil, fmt.Errorf("mapreduce: Output.NumTasks must be >= 1, got %d", spec.Output.NumTasks)
 	}
@@ -63,12 +64,13 @@ func NewCoordinator(spec Specification, intermediateDir string, timeout time.Dur
 	}
 
 	c := &Coordinator{
-		spec:            spec,
-		intermediateDir: intermediateDir,
-		done:            make(chan struct{}),
-		started:         time.Now(),
-		taskTimeout:     timeout,
-		waitHealthCheck: 30 * time.Second,
+		spec:              spec,
+		intermediateDir:   intermediateDir,
+		done:              make(chan struct{}),
+		started:           time.Now(),
+		taskTimeout:       timeout,
+		waitHealthCheck:   30 * time.Second,
+		fileServerAddress: fileServerAddress,
 	}
 	if err := c.buildTasks(); err != nil {
 		return nil, err
@@ -124,36 +126,38 @@ func (c *Coordinator) buildTasks() error {
 		}
 	}
 	for i, in := range inputs {
-		c.mapTasks = append(c.mapTasks, &taskState{
+		id := fmt.Sprintf("%s-map-%d", c.spec.TaskPrefix, i)
+		c.mapTasks[id] = &taskState{
 			task: &MapTask{
-				ID: i,
-
 				InputFile:   in.path,
 				InputFormat: in.format,
 				NumReduce:   c.spec.Output.NumTasks,
 				Mapper:      in.mapper,
 				Combiner:    c.spec.Output.Combiner,
 
-				IntermediateDir: c.intermediateDir,
-				Format:          outFormat,
+				IntermediateDir:   c.intermediateDir,
+				Format:            outFormat,
+				FileSourceAddress: c.fileServerAddress,
 			},
 			status: StatusPending,
-		})
+		}
 	}
 	for i := range c.spec.Output.NumTasks {
-		c.reduceTasks = append(c.reduceTasks, &taskState{
+		id := fmt.Sprintf("%s-reduce-%05d", c.spec.TaskPrefix, i)
+		c.reduceTasks[id] = &taskState{
 			task: &ReduceTask{
-				ID:       i,
-				Bucket:   i,
-				NumMap:   len(c.mapTasks),
-				Reducer:  c.spec.Output.Reducer,
-				Combiner: c.spec.Output.Combiner,
+				Bucket:        i,
+				MapFilePrefix: fmt.Sprintf("%s-map", c.spec.TaskPrefix),
+				NumMap:        len(c.mapTasks),
+				Reducer:       c.spec.Output.Reducer,
+				Combiner:      c.spec.Output.Combiner,
 
-				Format:          outFormat,
-				IntermediateDir: c.intermediateDir,
+				Format:            outFormat,
+				IntermediateDir:   c.intermediateDir,
+				FileSourceAddress: c.fileServerAddress,
 			},
 			status: StatusPending,
-		})
+		}
 	}
 	return nil
 }
@@ -285,7 +289,7 @@ func (c *Coordinator) readExpiredLocked() {
 	}
 }
 
-func (c *Coordinator) pickPendingLocked(tasks []*taskState) *taskState {
+func (c *Coordinator) pickPendingLocked(tasks map[string]*taskState) *taskState {
 	for _, ts := range tasks {
 		if ts.status == StatusPending {
 			ts.status = StatusRunning
@@ -297,7 +301,7 @@ func (c *Coordinator) pickPendingLocked(tasks []*taskState) *taskState {
 	return nil
 }
 
-func (c *Coordinator) allDoneLocked(tasks []*taskState) bool {
+func (c *Coordinator) allDoneLocked(tasks map[string]*taskState) bool {
 	for _, ts := range tasks {
 		if ts.status != StatusDone {
 			return false
@@ -325,7 +329,7 @@ func (c *Coordinator) finishLocked() {
 	c.doneOnce.Do(func() { close(c.done) })
 }
 
-func (c *Coordinator) countDoneLocked(tasks []*taskState) int64 {
+func (c *Coordinator) countDoneLocked(tasks map[string]*taskState) int64 {
 	n := 0
 	for _, ts := range tasks {
 		if ts.status == StatusDone {
@@ -335,17 +339,19 @@ func (c *Coordinator) countDoneLocked(tasks []*taskState) int64 {
 	return int64(n)
 }
 
-func (c *Coordinator) findTaskLocked(id int, tp TaskType) *taskState {
+func (c *Coordinator) findTaskLocked(id string, tp TaskType) *taskState {
 	if tp == MapType {
-		if id < 0 || id >= len(c.mapTasks) {
+		v, ok := c.mapTasks[id]
+		if !ok {
 			return nil
 		}
-		return c.mapTasks[id]
+		return v
 	}
-	if id < 0 || id >= len(c.reduceTasks) {
+	v, ok := c.reduceTasks[id]
+	if !ok {
 		return nil
 	}
-	return c.reduceTasks[id]
+	return v
 }
 
 func (c *Coordinator) outputFiles() []string {
