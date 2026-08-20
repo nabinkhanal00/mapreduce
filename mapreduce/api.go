@@ -18,8 +18,8 @@ type Mapper interface {
 }
 type MapperFunc func(ctx context.Context, key []byte, ival RecordIterator, emit Emitter) error
 
-func (f EmitterFunc) Map(ctx context.Context, key []byte, val []byte) error {
-	return f(ctx, key, val)
+func (f MapperFunc) Map(ctx context.Context, key []byte, ival RecordIterator, emit Emitter) error {
+	return f(ctx, key, ival, emit)
 }
 
 type Emitter interface {

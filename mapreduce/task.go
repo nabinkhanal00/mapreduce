@@ -6,7 +6,6 @@ import (
 	"encoding/gob"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"log"
 	"os"
 	"slices"
@@ -30,6 +29,19 @@ const (
 	ReduceType
 	NoneType
 )
+
+func (t TaskType) String() string {
+	switch t {
+	case MapType:
+		return "map"
+	case ReduceType:
+		return "reduce"
+	case NoneType:
+		return "none"
+	default:
+		return "unknown"
+	}
+}
 
 // for rpc to work on these interfaces
 func init() {
@@ -140,20 +152,39 @@ func (m MapTask) Execute(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		tempName := f.Name()
 		recordWriter, err := outFormat.Writer(f)
 		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(tempName)
 			return err
 		}
 		// closes the underlying file as well
 		slices.SortFunc(bucket, func(a, b format.Record) int { return bytes.Compare(a.Key, b.Key) })
 		for _, record := range bucket {
-			_ = recordWriter.Write(record)
+			if err := recordWriter.Write(record); err != nil {
+				_ = recordWriter.Close()
+				_ = os.Remove(tempName)
+				return err
+			}
+		}
+		if err := recordWriter.Close(); err != nil {
+			_ = os.Remove(tempName)
+			return err
 		}
 		destFilename := fmt.Sprintf("%s/%s-%d", m.IntermediateDir, m.ID, i)
-		_, _ = f.Seek(0, io.SeekStart)
-		_ = conn.PutFileContents(f, destFilename)
-		_ = os.Remove(f.Name())
-		_ = recordWriter.Close()
+		uf, err := os.Open(tempName)
+		if err != nil {
+			_ = os.Remove(tempName)
+			return err
+		}
+		if err := conn.PutFileContents(uf, destFilename); err != nil {
+			_ = uf.Close()
+			_ = os.Remove(tempName)
+			return err
+		}
+		_ = uf.Close()
+		_ = os.Remove(tempName)
 	}
 
 	return nil
@@ -329,21 +360,9 @@ func (r ReduceTask) Execute(ctx context.Context) error {
 
 	// Flush/close the format writer before uploading.
 	if err := writer.Close(); err != nil {
-		_ = f.Close()
 		_ = os.Remove(tempName)
-
 		return fmt.Errorf(
 			"mapreduce: close output writer: %w",
-			err,
-		)
-	}
-
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tempName)
-
-		return fmt.Errorf(
-			"mapreduce: seek output file: %w",
 			err,
 		)
 	}
@@ -351,11 +370,20 @@ func (r ReduceTask) Execute(ctx context.Context) error {
 	// Upload final output.
 	outputFilename := r.OutputBase
 
+	uf, err := os.Open(tempName)
+	if err != nil {
+		_ = os.Remove(tempName)
+		return fmt.Errorf(
+			"mapreduce: reopen output file: %w",
+			err,
+		)
+	}
+
 	if err := conn.PutFileContents(
-		f,
+		uf,
 		outputFilename,
 	); err != nil {
-		_ = f.Close()
+		_ = uf.Close()
 		_ = os.Remove(tempName)
 
 		return fmt.Errorf(
@@ -365,14 +393,7 @@ func (r ReduceTask) Execute(ctx context.Context) error {
 		)
 	}
 
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tempName)
-		return fmt.Errorf(
-			"mapreduce: close output file: %w",
-			err,
-		)
-	}
-
+	_ = uf.Close()
 	if err := os.Remove(tempName); err != nil {
 		return fmt.Errorf(
 			"mapreduce: remove temporary output: %w",

@@ -14,6 +14,17 @@ const (
 	RequestTypeWrite
 )
 
+func (r RequestType) String() string {
+	switch r {
+	case RequestTypeRead:
+		return "read"
+	case RequestTypeWrite:
+		return "write"
+	default:
+		return "unknown"
+	}
+}
+
 type FileServerConnection struct {
 	address    string
 	connection net.Conn

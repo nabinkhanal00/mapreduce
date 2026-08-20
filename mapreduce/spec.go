@@ -6,24 +6,24 @@ import (
 )
 
 type Input struct {
-	Mapper      string
-	FilePattern string
-	Format      string
+	Mapper      string `json:"mapper"`
+	FilePattern string `json:"file_pattern"`
+	Format      string `json:"format"`
 }
 
 type Output struct {
-	Filebase string
-	NumTasks int
-	Format   string
-	Reducer  string
-	Combiner string
+	Filebase string `json:"filebase"`
+	NumTasks int    `json:"num_tasks"`
+	Format   string `json:"format"`
+	Reducer  string `json:"reducer"`
+	Combiner string `json:"combiner"`
 }
 
 type Specification struct {
-	Inputs     []Input
-	Output     Output
-	Machines   int
-	TaskPrefix string
+	Inputs     []Input `json:"inputs"`
+	Output     Output  `json:"output"`
+	Machines   int     `json:"machines"`
+	TaskPrefix string  `json:"task_prefix"`
 }
 
 type Result struct {

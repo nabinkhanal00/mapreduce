@@ -2,8 +2,10 @@ package mapreduce
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/rpc"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -25,11 +27,30 @@ type taskState struct {
 type phase int
 
 const (
-	phaseMap phase = iota
+	phaseIdle phase = iota
+	phaseMap
 	phaseReduce
 	phaseDone
 )
 
+func (p phase) String() string {
+	switch p {
+	case phaseIdle:
+		return "idle"
+	case phaseMap:
+		return "map"
+	case phaseReduce:
+		return "reduce"
+	case phaseDone:
+		return "done"
+	default:
+		return "unknown"
+	}
+}
+
+// Coordinator is the master node. It is long-lived: workers keep polling
+// it for tasks, and jobs are submitted through SubmitJob, which resets the
+// coordinator for the next job while the RPC listener stays up.
 type Coordinator struct {
 	mu   sync.Mutex
 	spec Specification
@@ -49,10 +70,53 @@ type Coordinator struct {
 	waitHealthCheck time.Duration
 
 	result            Result
+	currentResult     chan Result
 	fileServerAddress string
+	jobSeq            int
+
+	logger *slog.Logger
 }
 
-func NewCoordinator(spec Specification, intermediateDir string, fileServerAddress string, timeout time.Duration) (*Coordinator, error) {
+// NewCoordinator creates an idle coordinator that has no job until
+// SubmitJob is called. fileServerAddress is the address workers use to
+// fetch input files and store intermediate and output files.
+func NewCoordinator(fileServerAddress string, timeout time.Duration) *Coordinator {
+	c := &Coordinator{
+		fileServerAddress: fileServerAddress,
+		done:              make(chan struct{}),
+		phase:             phaseIdle,
+		taskTimeout:       timeout,
+		waitHealthCheck:   30 * time.Second,
+		mapTasks:          make(map[string]*taskState),
+		reduceTasks:       make(map[string]*taskState),
+		logger:            defaultLogger(),
+	}
+	c.logger.Info("coordinator created",
+		"file_server", fileServerAddress,
+		"task_timeout", timeout.String(),
+	)
+	return c
+}
+
+// SetLogger sets the logger used for coordinator diagnostics. It must be
+// called before the coordinator starts serving requests.
+func (c *Coordinator) SetLogger(l *slog.Logger) {
+	if l == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.logger = l
+}
+
+func defaultLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{}))
+}
+
+// SubmitJob validates a specification and starts it as a new job. It is
+// rejected if a job is still running. The returned channel delivers the
+// job's Result exactly once when the job finishes.
+func (c *Coordinator) SubmitJob(spec Specification, intermediateDir string) (<-chan Result, error) {
 	if spec.Output.NumTasks < 1 {
 		return nil, fmt.Errorf("mapreduce: Output.NumTasks must be >= 1, got %d", spec.Output.NumTasks)
 	}
@@ -63,19 +127,45 @@ func NewCoordinator(spec Specification, intermediateDir string, fileServerAddres
 		return nil, fmt.Errorf("mapreduce: Output.Reducer must not be empty")
 	}
 
-	c := &Coordinator{
-		spec:              spec,
-		intermediateDir:   intermediateDir,
-		done:              make(chan struct{}),
-		started:           time.Now(),
-		taskTimeout:       timeout,
-		waitHealthCheck:   30 * time.Second,
-		fileServerAddress: fileServerAddress,
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.phase == phaseMap || c.phase == phaseReduce {
+		return nil, fmt.Errorf("mapreduce: job still running (phase %s)", c.phase)
 	}
+
+	c.spec = spec
+	c.intermediateDir = intermediateDir
+	c.mapTasks = make(map[string]*taskState)
+	c.reduceTasks = make(map[string]*taskState)
+	c.phase = phaseMap
+	c.started = time.Now()
+	c.result = Result{}
+	c.done = make(chan struct{})
+	c.doneOnce = sync.Once{}
+	c.currentResult = make(chan Result, 1)
+	c.jobSeq++
+
 	if err := c.buildTasks(); err != nil {
+		c.phase = phaseIdle
 		return nil, err
 	}
-	return c, nil
+	c.logger.Info("job submitted",
+		"job_seq", c.jobSeq,
+		"inputs", c.spec.Inputs,
+		"output", c.spec.Output,
+		"intermediate_dir", intermediateDir,
+		"map_tasks", len(c.mapTasks),
+		"reduce_tasks", len(c.reduceTasks),
+	)
+	return c.currentResult, nil
+}
+
+// CurrentPhase reports the coordinator phase (idle, map, reduce, done).
+func (c *Coordinator) CurrentPhase() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.phase.String()
 }
 
 type discoveredInput struct {
@@ -104,6 +194,11 @@ func (c *Coordinator) buildTasks() error {
 		}
 		for _, match := range matches {
 			inputs = append(inputs, discoveredInput{path: match, format: format, mapper: in.Mapper})
+			c.logger.Info("discovered input file",
+				"path", match,
+				"format", format,
+				"mapper", in.Mapper,
+			)
 		}
 	}
 	if len(inputs) == 0 {
@@ -129,6 +224,7 @@ func (c *Coordinator) buildTasks() error {
 		id := fmt.Sprintf("%s-map-%d", c.spec.TaskPrefix, i)
 		c.mapTasks[id] = &taskState{
 			task: &MapTask{
+				ID:          id,
 				InputFile:   in.path,
 				InputFormat: in.format,
 				NumReduce:   c.spec.Output.NumTasks,
@@ -146,11 +242,13 @@ func (c *Coordinator) buildTasks() error {
 		id := fmt.Sprintf("%s-reduce-%05d", c.spec.TaskPrefix, i)
 		c.reduceTasks[id] = &taskState{
 			task: &ReduceTask{
+				ID:            id,
 				Bucket:        i,
 				MapFilePrefix: fmt.Sprintf("%s-map", c.spec.TaskPrefix),
 				NumMap:        len(c.mapTasks),
 				Reducer:       c.spec.Output.Reducer,
 				Combiner:      c.spec.Output.Combiner,
+				OutputBase:    OutputName(c.spec.Output.Filebase, i),
 
 				Format:            outFormat,
 				IntermediateDir:   c.intermediateDir,
@@ -163,7 +261,15 @@ func (c *Coordinator) buildTasks() error {
 }
 
 func (c *Coordinator) Serve() (net.Listener, error) {
-	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	return c.serve("0.0.0.0:0")
+}
+
+func (c *Coordinator) ServeOn(listenAddr string) (net.Listener, error) {
+	return c.serve(listenAddr)
+}
+
+func (c *Coordinator) serve(listenAddr string) (net.Listener, error) {
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -172,15 +278,20 @@ func (c *Coordinator) Serve() (net.Listener, error) {
 		_ = listener.Close()
 		return nil, err
 	}
-	go accept(server, listener)
+	go accept(server, listener, c.logger)
 	c.addr = listener.Addr().String()
+	c.logger.Info("coordinator serving",
+		"addr", c.addr,
+		"phase", c.phase.String(),
+	)
 	return listener, nil
 }
 
-func accept(server *rpc.Server, listener net.Listener) {
+func accept(server *rpc.Server, listener net.Listener, logger *slog.Logger) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			logger.Warn("coordinator accept stopped", "err", err)
 			return
 		}
 		go server.ServeConn(conn)
@@ -197,21 +308,47 @@ func (c *Coordinator) ReportTask(args *ReportArgs, reply *ReportReply) error {
 
 	ts := c.findTaskLocked(args.TaskID, args.Type)
 	if ts == nil || ts.status != StatusRunning || ts.hostid != args.HostID {
+		c.logger.Warn("ignoring task report",
+			"job_seq", c.jobSeq,
+			"task_id", args.TaskID,
+			"task_type", args.Type.String(),
+			"host_id", args.HostID,
+			"err", args.Err,
+		)
 		return nil
 	}
 	if args.Err != "" {
 		ts.status = StatusPending
 		ts.hostid = ""
+		c.logger.Warn("task reported failure, requeued",
+			"job_seq", c.jobSeq,
+			"task_id", args.TaskID,
+			"task_type", args.Type.String(),
+			"host_id", args.HostID,
+			"err", args.Err,
+			"attempts", ts.attempts,
+		)
+		return nil
 	}
 	ts.status = StatusDone
+	c.logger.Info("task completed",
+		"job_seq", c.jobSeq,
+		"task_id", args.TaskID,
+		"task_type", args.Type.String(),
+		"host_id", args.HostID,
+		"phase", c.phase.String(),
+		"attempts", ts.attempts,
+	)
 
 	switch c.phase {
 	case phaseMap:
 		if c.allDoneLocked(c.mapTasks) {
+			c.logger.Info("all map tasks complete, starting reduce phase", "job_seq", c.jobSeq)
 			c.startReduceLocked()
 		}
 	case phaseReduce:
 		if c.allDoneLocked(c.reduceTasks) {
+			c.logger.Info("all reduce tasks complete, finishing job", "job_seq", c.jobSeq)
 			c.finishLocked()
 		}
 	}
@@ -228,7 +365,21 @@ func (c *Coordinator) HealthCheck(args *HealthCheckArgs, reply *HealthCheckReply
 	ts := c.findTaskLocked(args.TaskID, args.Type)
 	if ts == nil || ts.hostid != args.HostID || ts.status != StatusRunning {
 		reply.Stop = true
+		c.logger.Warn("health check rejected, worker should stop",
+			"job_seq", c.jobSeq,
+			"task_id", args.TaskID,
+			"task_type", args.Type.String(),
+			"host_id", args.HostID,
+		)
+		return nil
 	}
+	ts.healthCheck = time.Now()
+	c.logger.Debug("health check acknowledged",
+		"job_seq", c.jobSeq,
+		"task_id", args.TaskID,
+		"task_type", args.Type.String(),
+		"host_id", args.HostID,
+	)
 	return nil
 }
 
@@ -243,15 +394,32 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		if ts := c.pickPendingLocked(c.mapTasks); ts != nil {
 			ts.hostid = args.HostID
 			reply.Task = ts.task
+			c.logger.Info("assigned map task",
+				"job_seq", c.jobSeq,
+				"task_id", ts.task.GetID(),
+				"host_id", args.HostID,
+				"attempts", ts.attempts,
+			)
 			return nil
 		}
 		if !c.allDoneLocked(c.mapTasks) {
+			c.logger.Debug("no map task available",
+				"job_seq", c.jobSeq,
+				"host_id", args.HostID,
+			)
 			return nil
 		}
+		c.logger.Info("all map tasks complete, starting reduce phase", "job_seq", c.jobSeq)
 		c.startReduceLocked()
 		if ts := c.pickPendingLocked(c.reduceTasks); ts != nil {
 			ts.hostid = args.HostID
 			reply.Task = ts.task
+			c.logger.Info("assigned reduce task",
+				"job_seq", c.jobSeq,
+				"task_id", ts.task.GetID(),
+				"host_id", args.HostID,
+				"attempts", ts.attempts,
+			)
 			return nil
 		}
 		return nil
@@ -259,16 +427,30 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		if ts := c.pickPendingLocked(c.reduceTasks); ts != nil {
 			ts.hostid = args.HostID
 			reply.Task = ts.task
+			c.logger.Info("assigned reduce task",
+				"job_seq", c.jobSeq,
+				"task_id", ts.task.GetID(),
+				"host_id", args.HostID,
+				"attempts", ts.attempts,
+			)
 			return nil
 		}
-		if !c.allDoneLocked(c.mapTasks) {
+		if !c.allDoneLocked(c.reduceTasks) {
+			c.logger.Debug("no reduce task available",
+				"job_seq", c.jobSeq,
+				"host_id", args.HostID,
+			)
 			return nil
 		}
 		c.finishLocked()
-		reply.Done = true
 		return nil
 	default:
-		reply.Done = true
+		// idle or done: workers keep polling for the next job
+		c.logger.Debug("no job active, worker should keep polling",
+			"job_seq", c.jobSeq,
+			"phase", c.phase.String(),
+			"host_id", args.HostID,
+		)
 		return nil
 	}
 }
@@ -279,12 +461,24 @@ func (c *Coordinator) readExpiredLocked() {
 		if ts.status == StatusRunning && (now.After(ts.deadline) || now.Sub(ts.healthCheck) > c.waitHealthCheck) {
 			ts.status = StatusPending
 			ts.hostid = ""
+			c.logger.Warn("map task expired, requeued",
+				"job_seq", c.jobSeq,
+				"task_id", ts.task.GetID(),
+				"deadline", ts.deadline.Format(time.RFC3339Nano),
+				"attempts", ts.attempts,
+			)
 		}
 	}
 	for _, ts := range c.reduceTasks {
 		if ts.status == StatusRunning && (now.After(ts.deadline) || now.Sub(ts.healthCheck) > c.waitHealthCheck) {
 			ts.status = StatusPending
 			ts.hostid = ""
+			c.logger.Warn("reduce task expired, requeued",
+				"job_seq", c.jobSeq,
+				"task_id", ts.task.GetID(),
+				"deadline", ts.deadline.Format(time.RFC3339Nano),
+				"attempts", ts.attempts,
+			)
 		}
 	}
 }
@@ -294,6 +488,7 @@ func (c *Coordinator) pickPendingLocked(tasks map[string]*taskState) *taskState 
 		if ts.status == StatusPending {
 			ts.status = StatusRunning
 			ts.deadline = time.Now().Add(c.taskTimeout)
+			ts.healthCheck = time.Now()
 			ts.attempts++
 			return ts
 		}
@@ -326,7 +521,16 @@ func (c *Coordinator) finishLocked() {
 		Elapsed:     time.Since(c.started),
 		OutputFiles: c.outputFiles(),
 	}
+	c.logger.Info("job finished",
+		"job_seq", c.jobSeq,
+		"elapsed", c.result.Elapsed.String(),
+		"counters", c.result.Counters,
+		"output_files", c.result.OutputFiles,
+	)
 	c.doneOnce.Do(func() { close(c.done) })
+	if c.currentResult != nil {
+		c.currentResult <- c.result
+	}
 }
 
 func (c *Coordinator) countDoneLocked(tasks map[string]*taskState) int64 {
